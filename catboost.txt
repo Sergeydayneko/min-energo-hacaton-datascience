@@ -1,0 +1,90 @@
+import org.apache.spark.sql._
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions._
+
+
+// чтение данных погоды
+val weather = spark.read.format("parquet").load("weather.parquet")
+
+
+val requestDttm = "2019-08-03 15:00:00"
+val requestReg = "RU-MOS"
+
+
+
+// этот запрос коллектит массив из 240 фичей ( тип - Array[Option[Double]] ) по значению requestDttm и requestReg
+val numFeatures = 
+weather.
+filter(
+	col("request_dt").between(
+		date_add(lit(requestDttm).cast("timestamp").cast("date"), -1),
+		lit(requestDttm).cast("timestamp").cast("date")
+	)
+).filter(
+	col("reg") === lit(requestReg)
+).agg(
+	sort_array(collect_list(struct(col("request_dt"), col("features")))).alias("two_features")
+).select(
+	col("two_features")("features"),
+	substring(lit(requestDttm), 12, 2).cast("integer")
+).take(1).map{i =>
+	try {
+// парсим час
+		val hour = i.getAs[Int](1)
+// парсим массив из двух массивов
+		i(0) match {
+			case null => (0 until 240).map(i => None.asInstanceOf[Option[Double]]).toArray
+			case _ => {
+				val rawFeatures = i.getAs[Seq[Seq[Double]]](0) match {case sqv =>
+					sqv.head ++ sqv.last
+				}
+// отрезаем нужные фичи
+				rawFeatures.slice(
+					10*(hour+1), 10*(hour+1)+240
+				).map(t => Some(t).asInstanceOf[Option[Double]]).toArray
+			}
+		}
+	} catch {
+		case e: Exception => (0 until 240).map(i => None.asInstanceOf[Option[Double]]).toArray
+	}
+}.head
+
+
+
+
+// как скорить катбустом
+
+import ai.catboost.CatBoostModel
+import ai.catboost.CatBoostPredictions
+import org.apache.spark.SparkFiles
+
+
+
+def loadModel(
+	path:String
+):ai.catboost.CatBoostModel = {
+	val cbModel =  CatBoostModel.loadModel(path)
+	cbModel
+}
+
+
+
+// возвращает скор по списку фичей
+def getScore(
+	numFeatures:Array[Option[Double]],
+	cbModel:ai.catboost.CatBoostModel
+):Double = {
+// нужен на вход numFeatures - 
+	val prediction = cbModel.predict(
+// числовые фичи (нужно перевести во float и обработать пустые значения (они кодируются минимальным числом по умолчанию))
+		numFeatures.map(_.getOrElse(Double.MaxValue)).map(i => i.toFloat),
+// категориальных фичей нет
+		Array.empty[String]
+	).get(0, 0)
+// итоговый score от 0.0 до 1.0
+	val score = 1.0/(1.0 + math.exp((-1)*prediction))
+	score
+}
+
+
